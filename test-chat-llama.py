@@ -67,7 +67,7 @@ except Exception as e:
     raise
 
 # Initialize the language model
-model_name = "meta-llama/Llama-3.2-3B-Instruct"
+model_name = "meta-llama/Llama-3.2-1B-Instruct"
 try:
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -180,34 +180,42 @@ def construct_prompt(query, matches):
 **Examples:**
 
 **Question:** What was the closing price of AAPL on September 19, 2023?
-**Answer:** The closing price of AAPL on 2023-09-19 was $150.25.
+**Answer:** The closing price of **AAPL** on **September 19, 2023**, was **$150.25**.
 
 **Question:** Summarize the latest news about Tesla (TSLA).
-**Answer:** Tesla has recently unveiled its new Model Z, which promises to revolutionize electric vehicles. The car features advanced AI capabilities and longer battery life.
+**Answer:**
+Tesla has recently unveiled its new **Model Z**, which promises to revolutionize electric vehicles. Highlights include:
+- **Advanced AI capabilities** for autonomous driving.
+- **Extended battery life** increasing range by 20%.
+- **Innovative design** receiving positive industry reviews.
 
 **Question:** What are people saying about Microsoft?
-**Answer:** Recent tweets highlight Microsoft's latest software release, focusing on its improved user interface and enhanced security features.
+**Answer:**
+Recent tweets about **Microsoft** mention:
+- Excitement over the **latest software release** with improved user interface.
+- Discussions about **enhanced security features**.
+- Positive feedback on **performance improvements**.
 
 **Question:** List the top 5 performing stocks in Q3 2023.
 **Answer:**
 1. **Apple Inc. (AAPL):** Increased by 15% due to strong iPhone sales.
-2. **Microsoft Corp. (MSFT):** Rose by 12% following the release of new software.
+2. **Microsoft Corp. (MSFT):** Rose by 12% following new software releases.
 3. **Amazon.com Inc. (AMZN):** Gained 10% driven by e-commerce growth.
-4. **Alphabet Inc. (GOOGL):** Surged 8% thanks to advancements in AI technologies.
+4. **Alphabet Inc. (GOOGL):** Surged 8% thanks to advancements in AI.
 5. **Tesla Inc. (TSLA):** Boosted by a 7% rise from the launch of Model Z.
 """
 
     # Construct the prompt with detailed instructions
     prompt = f"""
-You are a highly knowledgeable AI assistant specialized in financial markets, stocks, and related news. Your goal is to provide accurate, concise, and helpful answers to the user's questions based on the provided context.
+You are a highly knowledgeable AI assistant specializing in financial markets, stocks, and related news. Your goal is to provide accurate, concise, and helpful answers based on the provided context.
 
 **Guidelines:**
-- Use the information in the context to formulate your response.
-- If the answer is not in the context, politely inform the user that you don't have that information.
-- Format your answer in clear, well-organized paragraphs.
-- Use line breaks where appropriate to enhance readability.
-- When listing multiple items, use numbered lists for clarity.
-- Focus on answering the question directly and thoroughly.
+- **Use information only from the context** to formulate your response.
+- **Organize your answer with clear paragraphs**, separating different ideas with line breaks.
+- When listing items or points, use **bullet points** or **numbered lists**.
+- **Highlight important names, dates, and figures** using **bold text** (enclosed in double asterisks `**`).
+- **Do not add any information** that is not present in the context.
+- Maintain a **professional and informative tone**.
 
 {examples}
 
@@ -436,10 +444,10 @@ def chatbot_response(query):
                         outputs = model.generate(
                             input_ids=inputs.input_ids,
                             attention_mask=inputs.attention_mask,
-                            max_new_tokens=250,  # Increased to allow for longer responses
+                            max_new_tokens=300,  # Increased to allow for longer responses
                             do_sample=True,
-                            top_p=0.85,          # Adjusted for better diversity
-                            temperature=0.65,    # Slightly lower for more focused responses
+                            top_p=0.9,          # Adjusted for better diversity
+                            temperature=0.7,    # Slightly lower for more focused responses
                             num_return_sequences=1,  # Return one response
                             pad_token_id=tokenizer.pad_token_id,
                             eos_token_id=tokenizer.eos_token_id,
