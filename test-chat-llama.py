@@ -97,9 +97,8 @@ if tokenizer and model:
 # Initialize the SentenceTransformer model for embeddings
 try:
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    embedding_model = embedding_model.to(
-        torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    )
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    embedding_model = embedding_model.to(device)
     logger.info("Loaded SentenceTransformer 'all-MiniLM-L6-v2' model.")
 except Exception as e:
     logger.error(f"Error loading SentenceTransformer model: {e}")
@@ -122,7 +121,8 @@ def construct_prompt(query, matches):
     context_sections = {
         'stock': [],
         'news': [],
-        'tweet': []
+        'tweet': [],
+        'forecast': []  # Added forecast section
     }
     for match in matches:
         metadata = match['metadata']
@@ -144,7 +144,7 @@ def construct_prompt(query, matches):
                 f"Summary: {summary}"
             )
             context_sections['stock'].append(stock_info)
-        elif metadata.get('type') == 'news' or metadata.get('type') == 'news2':
+        elif metadata.get('type') in ['news', 'news2']:
             headline = metadata.get('headline', 'No Headline')
             content = metadata.get('content', 'No Content')
             publication_date = metadata.get('publication_date', 'Unknown Date')
@@ -166,6 +166,16 @@ def construct_prompt(query, matches):
                 f"Content: {text}"
             )
             context_sections['tweet'].append(tweet_info)
+        elif metadata.get('type') == 'forecast':  # Handle forecast data
+            symbol = metadata.get('symbol', 'Unknown Symbol')
+            date = metadata.get('date', 'Unknown Date')
+            predicted_price = metadata.get('predicted_price', 'Unknown')
+            forecast_info = (
+                f"Stock Symbol: {symbol}\n"
+                f"Date: {date}\n"
+                f"Predicted Price: ${predicted_price}"
+            )
+            context_sections['forecast'].append(forecast_info)
 
     # Build the context string
     context = ""
@@ -175,47 +185,51 @@ def construct_prompt(query, matches):
             for info in infos:
                 context += f"{info}\n\n"
 
-    # Add few-shot examples to the prompt
+    # Add few-shot examples to the prompt (without '**')
     examples = """
 **Examples:**
 
 **Question:** What was the closing price of AAPL on September 19, 2023?
-**Answer:** The closing price of **AAPL** on **September 19, 2023**, was **$150.25**.
+**Answer:** The closing price of AAPL on September 19, 2023, was $150.25.
 
 **Question:** Summarize the latest news about Tesla (TSLA).
 **Answer:**
-Tesla has recently unveiled its new **Model Z**, which promises to revolutionize electric vehicles. Highlights include:
-- **Advanced AI capabilities** for autonomous driving.
-- **Extended battery life** increasing range by 20%.
-- **Innovative design** receiving positive industry reviews.
+Tesla has recently unveiled its new Model Z, which promises to revolutionize electric vehicles. Highlights include:
+- Advanced AI capabilities for autonomous driving.
+- Extended battery life increasing range by 20%.
+- Innovative design receiving positive industry reviews.
 
 **Question:** What are people saying about Microsoft?
 **Answer:**
-Recent tweets about **Microsoft** mention:
-- Excitement over the **latest software release** with improved user interface.
-- Discussions about **enhanced security features**.
-- Positive feedback on **performance improvements**.
+Recent tweets about Microsoft mention:
+- Excitement over the latest software release with improved user interface.
+- Discussions about enhanced security features.
+- Positive feedback on performance improvements.
 
 **Question:** List the top 5 performing stocks in Q3 2023.
 **Answer:**
-1. **Apple Inc. (AAPL):** Increased by 15% due to strong iPhone sales.
-2. **Microsoft Corp. (MSFT):** Rose by 12% following new software releases.
-3. **Amazon.com Inc. (AMZN):** Gained 10% driven by e-commerce growth.
-4. **Alphabet Inc. (GOOGL):** Surged 8% thanks to advancements in AI.
-5. **Tesla Inc. (TSLA):** Boosted by a 7% rise from the launch of Model Z.
+1. Apple Inc. (AAPL): Increased by 15% due to strong iPhone sales.
+2. Microsoft Corp. (MSFT): Rose by 12% following new software releases.
+3. Amazon.com Inc. (AMZN): Gained 10% driven by e-commerce growth.
+4. Alphabet Inc. (GOOGL): Surged 8% thanks to advancements in AI.
+5. Tesla Inc. (TSLA): Boosted by a 7% rise from the launch of Model Z.
+
+**Question:** What is the predicted closing price of NVDA on October 25, 2024?
+**Answer:**
+The predicted closing price of NVDA on October 25, 2024, is $700.50.
 """
 
-    # Construct the prompt with detailed instructions
+    # Construct the prompt with detailed instructions (without bolding)
     prompt = f"""
 You are a highly knowledgeable AI assistant specializing in financial markets, stocks, and related news. Your goal is to provide accurate, concise, and helpful answers based on the provided context.
 
 **Guidelines:**
-- **Use information only from the context** to formulate your response.
-- **Organize your answer with clear paragraphs**, separating different ideas with line breaks.
-- When listing items or points, use **bullet points** or **numbered lists**.
-- **Highlight important names, dates, and figures** using **bold text** (enclosed in double asterisks `**`).
-- **Do not add any information** that is not present in the context.
-- Maintain a **professional and informative tone**.
+- Use information only from the context to formulate your response.
+- Organize your answer with clear paragraphs, separating different ideas with line breaks.
+- When listing items or points, use bullet points or numbered lists.
+- Do not add any information that is not present in the context.
+- Maintain a professional and informative tone.
+
 
 {examples}
 
@@ -260,7 +274,7 @@ def parse_stock_query(query):
                     date_obj = datetime.strptime(date_str, '%B %d, %Y')  # e.g., September 19, 2019
                 except ValueError:
                     date_obj = datetime.strptime(date_str, '%Y-%m-%d')  # e.g., 2019-09-19
-                date = date_obj.strftime('%Y-%m-%d')
+                date = date_obj.strftime('%d/%m/%Y')  # Changed to DD/MM/YYYY
                 return price_type, symbol, date
             except ValueError:
                 logger.error(f"Invalid date format in query: {date_str}")
@@ -364,7 +378,7 @@ def chatbot_response(query):
 
             # Construct the response
             tweets_list = "\n".join(tweets)
-            response = f"Here are some tweets by {writer_name}:\n{tweets_list}"
+            response = f"Here are some tweets by {writer_name.capitalize()}:\n{tweets_list}"
             logger.info(f"Responding with tweets for writer '{writer_name}'.")
             return response
 
@@ -396,8 +410,8 @@ def chatbot_response(query):
                         include_values=False,
                         include_metadata=True,
                         filter={
-                            "type": {"$in": ["news", "news2", "stock", "tweet"]},
-                            # Additional filters can be added here
+                            "type": {"$in": ["news", "news2", "stock", "tweet", "forecast"]},
+                            # Include 'forecast' type
                         }
                     )
                     logger.debug(f"Pinecone search response for general query: {search_response}")
@@ -469,6 +483,9 @@ def chatbot_response(query):
                     logger.error(f"Error decoding model output: {e}")
                     return "An error occurred while processing the model's response."
 
+                # Remove '**' from the response
+                response = response.replace('**', '')
+
                 # Clean up the response while preserving line breaks and numbered lists
                 response_lines = response.split('\n')
                 cleaned_lines = []
@@ -488,10 +505,10 @@ def chatbot_response(query):
                     return response
 
     except Exception as e:
-        logger.error(f"Error processing query '{query}': {e}")
-        return "An error occurred while processing your request. Please try again later."
+        logger.error(f"An error occurred in chatbot_response: {e}")
+        return "An error occurred while processing your request."
 
-# Initialize Flask app
+# Initialize Flask app (dedented to be outside the chatbot_response function)
 app = Flask(__name__)
 CORS(app)
 
