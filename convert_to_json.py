@@ -35,11 +35,11 @@ def save_json_to_file(json_data, output_file):
 
 # Danh sách các file CSV và tên file JSON tương ứng
 csv_files = [
-    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Prophet\forecast_30_days(Prophet_AAPL).csv",
-    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Prophet\forecast_30_days(Prophet_GOOGL).csv",
-    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Prophet\forecast_30_days(Prophet_MSFT).csv",
-    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Prophet\forecast_30_days(Prophet_TSLA).csv",
-    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Prophet\forecast_30_days(Prophet_AMZN).csv"
+    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid\forecast_30_days(Hybrid_AAPL).csv",
+    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid\forecast_30_days(Hybrid_GOOGL).csv",
+    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid\forecast_30_days(Hybrid_MSFT).csv",
+    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid\forecast_30_days(Hybrid_TSLA).csv",
+    r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid\forecast_30_days(Hybrid_AMZN).csv"
 ]
 
 
