@@ -6,14 +6,15 @@ import logging
 import argparse
 import time
 import random
-import math
-from datetime import datetime, timedelta
+import json  # New import for handling JSON files
+from datetime import datetime
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from sentence_transformers import SentenceTransformer
 import yfinance as yf
 from datasets import load_dataset
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import glob  # For handling file patterns
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -53,21 +54,17 @@ else:
 index = pc.Index(index_name)
 
 # Initialize SentenceTransformer model
-logger.info("Loading SentenceTransformer 'all-MiniLM-L6-v2'...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 logger.info("SentenceTransformer 'all-MiniLM-L6-v2' loaded successfully.")
 
 # Load datasets
-logger.info("Loading datasets...")
 stock_dataset = load_dataset("jyanimaulik/yahoo_finance_stock_market_news")  # Existing news dataset
 tweet_dataset = load_dataset("mjw/stock_market_tweets")
 news2_dataset = load_dataset("jyanimaulik/yahoo_finance_stockmarket_news")  # New news2 dataset
 logger.info("Datasets loaded successfully.")
 
-# Define folder paths for stock data and forecast data
-base_dir = os.path.dirname(os.path.abspath(__file__))
-stock_folder_path = os.path.join(base_dir, 'Dataset', 'Dataset-Yahoo')
-forecast_folder_path = os.path.join(base_dir, 'Forecast_Stock', 'Result_CSV')
+# Define folder path for stock data CSVs
+folder_path = r'C:\Users\Pham Ty\Desktop\Thesis\Dataset\Dataset-Yahoo'
 
 # List of stock symbols
 stock_symbols = [
@@ -166,19 +163,6 @@ def generate_unique_id(source_url, publication_date, headline):
     unique_string = f"{source_url}_{publication_date}_{headline}"
     return hashlib.md5(unique_string.encode('utf-8')).hexdigest()
 
-def sanitize_metadata(metadata):
-    """
-    Removes or replaces any NaN values in the metadata dictionary to ensure JSON compatibility.
-    """
-    sanitized = {}
-    for key, value in metadata.items():
-        if isinstance(value, float) and math.isnan(value):
-            # Replace NaN with None
-            sanitized[key] = None
-        else:
-            sanitized[key] = value
-    return sanitized
-
 def upsert_with_retry(index, vectors, max_retries=3):
     """
     Upsert vectors with retry logic.
@@ -197,140 +181,285 @@ def upsert_with_retry(index, vectors, max_retries=3):
     logger.error("All upsert attempts failed.")
     return False
 
-def upsert_forecast_data(forecast_folder_path, index, embedding_model):
+def upsert_news_data(dataset, index, embedding_model):
     """
-    Upsert forecast data from CSV files into Pinecone index.
-    Only pushes processed data: Symbol, Date, Predicted_Price
+    Upsert news data from the dataset into the Pinecone index with optimized metadata.
     """
-    vectors = []
-    batch_size = 50  # Adjust batch size if needed
-    forecast_files = [f for f in os.listdir(forecast_folder_path) if f.startswith('forecast_summary') and f.endswith('.csv')]
+    batch_size = 100
+    total_items = len(dataset['train'])
 
-    for file in forecast_files:
-        file_path = os.path.join(forecast_folder_path, file)
-        try:
-            df = pd.read_csv(file_path)
-            logger.info(f"Successfully read file {file_path}")
-        except Exception as e:
-            logger.error(f"Error reading {file}: {e}", exc_info=True)
+    text_summaries = []
+    vector_ids = []
+    metadatas = []
+
+    for i, item in enumerate(dataset['train']):
+        instruction = item.get('instruction', '').strip()
+        input_text = item.get('input', '').strip()
+
+        # Skip if essential fields are missing
+        if not instruction or not input_text:
+            logger.warning(f"Skipping news item due to missing fields: {item}")
             continue
 
-        # Check for required columns (excluding 'Date')
-        required_columns = ['Symbol', 'RMSE', 'MSE', 'MAPE', 'Predicted_Prices', 'Actual_Prices', 'Future_Price_Predictions', 'Train_Prices']
-        if not all(col in df.columns for col in required_columns):
-            logger.error(f"{file} is missing one or more required columns: {required_columns}")
+        # Extract information from instruction and input_text
+        publication_date = extract_publication_date(instruction)
+        source_url = extract_source_url(instruction)
+        headline, content = extract_headline_content(input_text)
+
+        if not publication_date or not source_url:
+            logger.warning(f"Skipping news item due to missing publication date or source URL: {item}")
             continue
 
-        for _, row in df.iterrows():
-            symbol = row['Symbol']
-            # Extract model name from filename
-            model_name = file.replace('forecast_summary', '').replace('.csv', '').strip('_').lower()
-            if not model_name:
-                model_name = 'baseline'
-            vector_id = f"FORECAST_{symbol}_{model_name}"
+        # Create text_summary for embedding
+        text_summary = f"{headline}\n{content}"
 
-            # Get future price predictions
-            if isinstance(row['Future_Price_Predictions'], str):
-                try:
-                    future_prices = [float(item.strip()) for item in row['Future_Price_Predictions'].split(',')]
-                except:
-                    future_prices = []
-            elif isinstance(row['Future_Price_Predictions'], list):
-                future_prices = row['Future_Price_Predictions']
+        # Generate unique ID
+        vector_id = generate_unique_id(source_url, publication_date, headline)
+
+        # Prepare metadata
+        metadata = {
+            "type": "news",
+            "publication_date": publication_date,  # YYYY-MM-DD
+            "source_url": source_url,
+            "headline": headline,
+            "content": content
+        }
+
+        # Append to lists
+        text_summaries.append(text_summary)
+        vector_ids.append(vector_id)
+        metadatas.append(metadata)
+
+        # Process batch
+        if len(text_summaries) >= batch_size or (i + 1) == total_items:
+            # Generate embeddings for batch
+            try:
+                embeddings = embedding_model.encode(text_summaries, batch_size=batch_size, show_progress_bar=False)
+            except Exception as e:
+                logger.error(f"Error generating embeddings for batch: {e}", exc_info=True)
+                # Skip this batch
+                text_summaries = []
+                vector_ids = []
+                metadatas = []
+                continue
+
+            # Prepare vectors
+            batch_vectors = [{
+                "id": vid,
+                "values": emb.tolist(),
+                "metadata": meta
+            } for vid, emb, meta in zip(vector_ids, embeddings, metadatas)]
+
+            # Upsert batch
+            success = upsert_with_retry(index, batch_vectors)
+            if success:
+                logger.info(f"Upserted batch of {len(batch_vectors)} news articles.")
             else:
-                future_prices = []
+                # If upsert failed after retries, attempt to upsert individually
+                logger.warning("Attempting to upsert news articles individually due to batch failure.")
+                for vector in batch_vectors:
+                    if not upsert_with_retry(index, [vector]):
+                        logger.error(f"Failed to upsert news article with ID: {vector['id']}")
+            # Reset lists
+            text_summaries = []
+            vector_ids = []
+            metadatas = []
 
-            # Get the last date from the stock data or use current date
-            stock_data_file = os.path.join(stock_folder_path, f"{symbol}.csv")
-            if os.path.exists(stock_data_file):
-                try:
-                    df_stock = pd.read_csv(stock_data_file)
-                    if 'Date' in df_stock.columns:
-                        df_stock['Date'] = pd.to_datetime(df_stock['Date'], errors='coerce')
-                        last_date = df_stock['Date'].max()
-                        if pd.isnull(last_date):
-                            last_date = datetime.now()
-                    else:
-                        logger.warning(f"'Date' column not found in stock data for {symbol}. Using current date.")
-                        last_date = datetime.now()
-                except Exception as e:
-                    logger.error(f"Error reading stock data for {symbol}: {e}", exc_info=True)
-                    last_date = datetime.now()
+    logger.info("All news data has been uploaded to Pinecone.")
+
+def upsert_news2_data(dataset, index, embedding_model):
+    """
+    Upsert news2 data from the dataset into the Pinecone index with optimized metadata.
+    """
+    batch_size = 100
+    total_items = len(dataset['train'])
+
+    text_summaries = []
+    vector_ids = []
+    metadatas = []
+
+    for i, item in enumerate(dataset['train']):
+        instruction = item.get('instruction', '').strip()
+        input_text = item.get('input', '').strip()
+
+        # Skip if essential fields are missing
+        if not instruction or not input_text:
+            logger.warning(f"Skipping news2 item due to missing fields: {item}")
+            continue
+
+        # Extract publication date and source URL from instruction if available
+        publication_date = extract_publication_date(instruction)
+        source_url = extract_source_url(instruction)
+
+        # Extract headline and content from input_text
+        headline, content = extract_headline_content(input_text)
+
+        if not publication_date or not source_url:
+            logger.warning(f"Skipping news2 item due to missing publication date or source URL: {item}")
+            continue
+
+        # Create text_summary for embedding
+        text_summary = f"{headline}\n{content}"
+
+        # Generate unique ID
+        vector_id = generate_unique_id(source_url, publication_date, headline)
+
+        # Prepare metadata
+        metadata = {
+            "type": "news2",
+            "publication_date": publication_date,  # YYYY-MM-DD
+            "source_url": source_url,
+            "headline": headline,
+            "content": content
+        }
+
+        # Append to lists
+        text_summaries.append(text_summary)
+        vector_ids.append(vector_id)
+        metadatas.append(metadata)
+
+        # Process batch
+        if len(text_summaries) >= batch_size or (i + 1) == total_items:
+            # Generate embeddings for batch
+            try:
+                embeddings = embedding_model.encode(text_summaries, batch_size=batch_size, show_progress_bar=False)
+            except Exception as e:
+                logger.error(f"Error generating embeddings for batch: {e}", exc_info=True)
+                # Skip this batch
+                text_summaries = []
+                vector_ids = []
+                metadatas = []
+                continue
+
+            # Prepare vectors
+            batch_vectors = [{
+                "id": vid,
+                "values": emb.tolist(),
+                "metadata": meta
+            } for vid, emb, meta in zip(vector_ids, embeddings, metadatas)]
+
+            # Upsert batch
+            success = upsert_with_retry(index, batch_vectors)
+            if success:
+                logger.info(f"Upserted batch of {len(batch_vectors)} news2 articles.")
             else:
-                logger.warning(f"Stock data file not found for {symbol}. Using current date.")
-                last_date = datetime.now()
+                # If upsert failed after retries, attempt to upsert individually
+                logger.warning("Attempting to upsert news2 articles individually due to batch failure.")
+                for vector in batch_vectors:
+                    if not upsert_with_retry(index, [vector]):
+                        logger.error(f"Failed to upsert news2 article with ID: {vector['id']}")
+            # Reset lists
+            text_summaries = []
+            vector_ids = []
+            metadatas = []
 
-            future_dates = [last_date + timedelta(days=i) for i in range(1, len(future_prices)+1)]
+    logger.info("All news2 data has been uploaded to Pinecone.")
 
-            for date, pred_price in zip(future_dates, future_prices):
-                # Create unique ID for each forecasted day
-                daily_vector_id = f"{vector_id}_{date.strftime('%Y-%m-%d')}"
+def upsert_tweet_data(dataset, index, embedding_model):
+    """
+    Upsert tweet data from the dataset into Pinecone index with normalized metadata.
+    """
+    batch_size = 100  # Adjust as needed
+    total_items = len(dataset['train'])
 
-                # Create text summary for embedding
-                text_summary = f"{symbol} predicted price on {date.strftime('%Y-%m-%d')} is {pred_price}."
+    text_contents = []
+    vector_ids = []
+    metadatas = []
 
-                # Generate embedding
-                try:
-                    embedding = embedding_model.encode(text_summary).tolist()
-                except Exception as e:
-                    logger.error(f"Error generating embedding for {daily_vector_id}: {e}", exc_info=True)
-                    continue
+    for i, item in enumerate(dataset['train']):
+        # Extract necessary fields with default values
+        tweet_id = item.get('tweet_id')
+        writer = (item.get('writer') or '').strip().lower()  # Normalize to lowercase and strip spaces
+        post_date = (item.get('post_date') or '').strip()
+        body = (item.get('body') or '').strip()
+        comment_num = item.get('comment_num', 0)
+        retweet_num = item.get('retweet_num', 0)
+        like_num = item.get('like_num', 0)
+        ticker_symbol = (item.get('ticker_symbol') or '').strip().upper()
 
-                # Prepare metadata
-                metadata = {
-                    "type": "forecast",
-                    "symbol": symbol,
-                    "date": date.strftime('%Y-%m-%d'),
-                    "predicted_price": pred_price
-                }
+        # Skip if essential fields are missing
+        if not tweet_id or not writer or not body:
+            logger.warning(f"Skipping tweet due to missing fields: {item}")
+            continue
 
-                # Sanitize metadata to remove NaN values
-                metadata = sanitize_metadata(metadata)
+        # Truncate text to a maximum of 200 characters
+        max_text_length = 200
+        text_content = body[:max_text_length] if len(body) > max_text_length else body
 
-                # Append to vectors list
-                vectors.append({
-                    "id": daily_vector_id,
-                    "values": embedding,
-                    "metadata": metadata
-                })
+        # Create unique ID
+        vector_id = f"TWEET_{tweet_id}"
 
-                # Upsert batch
-                if len(vectors) >= batch_size:
-                    success = upsert_with_retry(index, vectors)
-                    if success:
-                        logger.info(f"Upserted batch of {len(vectors)} forecast records from {file}.")
-                        vectors = []
-                    else:
-                        logger.error(f"Failed to upsert forecast batch from {file}.")
+        # Prepare metadata
+        metadata = {
+            "type": "tweet",
+            "tweet_id": tweet_id,
+            "writer": writer,  # Normalized writer name
+            "post_date": post_date,
+            "comment_num": comment_num,
+            "retweet_num": retweet_num,
+            "like_num": like_num,
+            "ticker_symbol": ticker_symbol,
+            "text": text_content  # Truncated text
+        }
 
-    # Upsert any remaining vectors
-    if vectors:
-        success = upsert_with_retry(index, vectors)
-        if success:
-            logger.info(f"Upserted final batch of {len(vectors)} forecast records.")
-        else:
-            logger.error("Failed to upsert final forecast batch.")
+        # Append to lists
+        text_contents.append(text_content)
+        vector_ids.append(vector_id)
+        metadatas.append(metadata)
 
-    logger.info("All forecast data has been uploaded to Pinecone.")
+        # Process batch
+        if len(text_contents) >= batch_size or (i + 1) == total_items:
+            # Generate embeddings for batch
+            try:
+                embeddings = embedding_model.encode(text_contents, batch_size=batch_size, show_progress_bar=False)
+            except Exception as e:
+                logger.error(f"Error generating embeddings for batch: {e}", exc_info=True)
+                # Skip this batch
+                text_contents = []
+                vector_ids = []
+                metadatas = []
+                continue
+
+            # Prepare vectors
+            batch_vectors = [{
+                "id": vid,
+                "values": emb.tolist(),
+                "metadata": meta
+            } for vid, emb, meta in zip(vector_ids, embeddings, metadatas)]
+
+            # Upsert batch
+            success = upsert_with_retry(index, batch_vectors)
+            if success:
+                logger.info(f"Upserted batch of {len(batch_vectors)} tweets.")
+            else:
+                # If upsert failed after retries, attempt to upsert individually
+                logger.warning("Attempting to upsert tweets individually due to batch failure.")
+                for vector in batch_vectors:
+                    if not upsert_with_retry(index, [vector]):
+                        logger.error(f"Failed to upsert tweet with ID: {vector['id']}")
+            # Reset lists
+            text_contents = []
+            vector_ids = []
+            metadatas = []
+
+    logger.info("All tweet data has been uploaded to Pinecone.")
 
 def upsert_stock_data(csv_file, index, embedding_model):
     """
     Upsert stock data from CSV file into Pinecone index.
-    Only pushes processed data: Date, Symbol, Close Price
     """
     # Full path to CSV file
-    file_path = os.path.join(stock_folder_path, csv_file)
+    file_path = os.path.join(folder_path, csv_file)
 
     # Read data from CSV
     try:
         df = pd.read_csv(file_path)
-        logger.info(f"Successfully read file {file_path}")
     except Exception as e:
         logger.error(f"Error reading {csv_file}: {e}", exc_info=True)
         return
 
     # Select necessary columns and drop NaN
-    required_columns = ['Date', 'Close']
+    required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
     if not all(col in df.columns for col in required_columns):
         logger.error(f"{csv_file} is missing one or more required columns: {required_columns}")
         return
@@ -358,18 +487,23 @@ def upsert_stock_data(csv_file, index, embedding_model):
         vector_id = f"{symbol}_{row['Date']}"
 
         # Create text summary
-        text_summary = f"{symbol} closing price on {row['Date']} is {row['Close']}."
+        text_summary = (
+            f"On {row['Date']}, {symbol} opened at ${row['Open']}, reached a high of ${row['High']}, "
+            f"a low of ${row['Low']}, and closed at ${row['Close']}. "
+            f"The trading volume was {row['Volume']} shares."
+        )
 
         # Prepare metadata
         metadata = {
             "type": "stock",
             "symbol": symbol,
             "date": row['Date'],
-            "close_price": row['Close']
+            "open": float(row['Open']),
+            "high": float(row['High']),
+            "low": float(row['Low']),
+            "close": float(row['Close']),
+            "summary": text_summary
         }
-
-        # Sanitize metadata to remove NaN values
-        metadata = sanitize_metadata(metadata)
 
         # Append to lists
         text_summaries.append(text_summary)
@@ -407,20 +541,193 @@ def upsert_stock_data(csv_file, index, embedding_model):
 
     logger.info(f"Data from {csv_file} has been uploaded to Pinecone.")
 
+# --- Updated Function to Upsert Forecast Data ---
+def upsert_forecast_data(forecast_files, index, embedding_model):
+    """
+    Upsert forecast data from JSON files into Pinecone index.
+    """
+    batch_size = 100
+
+    for forecast_file in forecast_files:
+        # Extract symbol from filename
+        match = re.search(r'forecast_30_days\(Hybrid_(\w+)\)\.json$', forecast_file)
+        if not match:
+            logger.warning(f"Filename {forecast_file} does not match expected pattern. Skipping.")
+            continue
+        symbol = match.group(1)
+        logger.info(f"Processing forecast data for {symbol} from {forecast_file}")
+
+        # Read JSON
+        try:
+            with open(forecast_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"Error reading {forecast_file}: {e}", exc_info=True)
+            continue
+
+        # Check if data is a list
+        if not isinstance(data, list):
+            logger.error(f"Data in {forecast_file} is not a list. Skipping.")
+            continue
+
+        text_summaries = []
+        vector_ids = []
+        metadatas = []
+
+        for entry in data:
+            instruction = entry.get('instruction', '').strip()
+            output = entry.get('output', '').strip()
+
+            # Skip if essential fields are missing
+            if not instruction or not output:
+                logger.warning(f"Skipping forecast entry due to missing fields: {entry}")
+                continue
+
+            # Extract date from instruction
+            date_match = re.search(r'vào ngày (\d{1,2}/\d{1,2}/\d{4})\?', instruction)
+            if not date_match:
+                logger.warning(f"Could not extract date from instruction: {instruction}")
+                continue
+            date_str = date_match.group(1)
+            try:
+                # Convert to ISO format
+                date_obj = datetime.strptime(date_str, '%m/%d/%Y')
+                date_iso = date_obj.strftime('%Y-%m-%d')
+            except ValueError:
+                logger.warning(f"Invalid date format found: {date_str}")
+                continue
+
+            # Extract predicted price from output
+            price_match = re.search(r'giá\.? .*? (\d+\.?\d*) đô', output, re.IGNORECASE)
+            if not price_match:
+                logger.warning(f"Could not extract price from output: {output}")
+                continue
+            predicted_price = price_match.group(1)
+            try:
+                predicted_price = float(predicted_price)
+            except ValueError:
+                logger.warning(f"Invalid price format found: {predicted_price}")
+                continue
+
+            # Create unique ID
+            vector_id = f"FORECAST_{symbol}_{date_iso}"
+
+            # Create text summary
+            text_summary = (
+                f"On {date_iso}, {symbol} is predicted to have a price of ${predicted_price}."
+            )
+
+            # Prepare metadata
+            metadata = {
+                "type": "forecast",
+                "symbol": symbol,
+                "date": date_iso,
+                "predicted_price": predicted_price
+            }
+
+            # Append to lists
+            text_summaries.append(text_summary)
+            vector_ids.append(vector_id)
+            metadatas.append(metadata)
+
+            # Process batch
+            if len(text_summaries) >= batch_size:
+                # Generate embeddings for batch
+                try:
+                    embeddings = embedding_model.encode(text_summaries, batch_size=batch_size, show_progress_bar=False)
+                except Exception as e:
+                    logger.error(f"Error generating embeddings for batch in {forecast_file}: {e}", exc_info=True)
+                    # Skip this batch
+                    text_summaries = []
+                    vector_ids = []
+                    metadatas = []
+                    continue
+
+                # Prepare vectors
+                batch_vectors = [{
+                    "id": vid,
+                    "values": emb.tolist(),
+                    "metadata": meta
+                } for vid, emb, meta in zip(vector_ids, embeddings, metadatas)]
+
+                # Upsert batch
+                success = upsert_with_retry(index, batch_vectors)
+                if success:
+                    logger.info(f"Upserted batch of {len(batch_vectors)} forecast entries for {symbol}.")
+                else:
+                    # If upsert failed after retries, attempt to upsert individually
+                    logger.warning("Attempting to upsert forecast entries individually due to batch failure.")
+                    for vector in batch_vectors:
+                        if not upsert_with_retry(index, [vector]):
+                            logger.error(f"Failed to upsert forecast entry with ID: {vector['id']}")
+                # Reset lists
+                text_summaries = []
+                vector_ids = []
+                metadatas = []
+
+        # Upsert any remaining entries
+        if text_summaries:
+            try:
+                embeddings = embedding_model.encode(text_summaries, batch_size=batch_size, show_progress_bar=False)
+            except Exception as e:
+                logger.error(f"Error generating embeddings for final batch in {forecast_file}: {e}", exc_info=True)
+                # Skip this batch
+                text_summaries = []
+                vector_ids = []
+                metadatas = []
+            else:
+                # Prepare vectors
+                batch_vectors = [{
+                    "id": vid,
+                    "values": emb.tolist(),
+                    "metadata": meta
+                } for vid, emb, meta in zip(vector_ids, embeddings, metadatas)]
+
+                # Upsert batch
+                success = upsert_with_retry(index, batch_vectors)
+                if success:
+                    logger.info(f"Upserted final batch of {len(batch_vectors)} forecast entries for {symbol}.")
+                else:
+                    # If upsert failed after retries, attempt to upsert individually
+                    logger.warning("Attempting to upsert final forecast entries individually due to batch failure.")
+                    for vector in batch_vectors:
+                        if not upsert_with_retry(index, [vector]):
+                            logger.error(f"Failed to upsert forecast entry with ID: {vector['id']}")
+
+        logger.info(f"All forecast data for {symbol} has been uploaded to Pinecone.")
+
+    logger.info("All forecast data has been uploaded to Pinecone successfully.")
+
+# --- End of Updated Function ---
+
+def upsert_forecast_data_from_folder(forecast_folder_path, index, embedding_model):
+    """
+    Locate all forecast JSON files in the specified folder and upsert them.
+    """
+    # Define the pattern to match forecast JSON files
+    forecast_pattern = os.path.join(forecast_folder_path, 'forecast_30_days(Hybrid_*).json')
+    forecast_files = glob.glob(forecast_pattern)
+
+    if not forecast_files:
+        logger.warning(f"No forecast files found in {forecast_folder_path} matching pattern 'forecast_30_days(Hybrid_*.json)'.")
+        return
+
+    upsert_forecast_data(forecast_files, index, embedding_model)
+
 def main(upsert_tweets=False, upsert_stocks=False, upsert_news=False, upsert_news2=False, upsert_forecast=False):
     logger.info("Starting the data upload process to Pinecone.")
 
     # Step 1: Download and upsert stock data
     if upsert_stocks:
         logger.info("Starting download of stock data.")
-        os.makedirs(stock_folder_path, exist_ok=True)  # Ensure directory exists
+        os.makedirs(folder_path, exist_ok=True)  # Ensure directory exists
         # Utilize concurrency for faster downloads
         with ThreadPoolExecutor(max_workers=5) as executor:
-            executor.map(lambda symbol: download_stock_data(symbol, stock_folder_path, start_date, end_date), stock_symbols)
+            executor.map(lambda symbol: download_stock_data(symbol, folder_path, start_date, end_date), stock_symbols)
         logger.info("All stock data downloaded successfully.")
-
+        
         logger.info("Starting upsert of stock data into Pinecone.")
-        csv_files = [f for f in os.listdir(stock_folder_path) if f.endswith('.csv')]
+        csv_files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(upsert_stock_data, csv_file, index, embedding_model): csv_file for csv_file in csv_files}
             for future in as_completed(futures):
@@ -428,7 +735,7 @@ def main(upsert_tweets=False, upsert_stocks=False, upsert_news=False, upsert_new
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error(f"Error processing {csv_file}: {e}", exc_info=True)
+                    logger.error(f"Error processing {csv_file}: {e}")
         logger.info("All stock data uploaded to Pinecone successfully.")
 
     # Step 2: Upsert news data into Pinecone
@@ -437,25 +744,26 @@ def main(upsert_tweets=False, upsert_stocks=False, upsert_news=False, upsert_new
         upsert_news_data(stock_dataset, index, embedding_model)
         logger.info("All news data uploaded to Pinecone successfully.")
 
-    # Step 3: Upsert news2 data into Pinecone
-    if upsert_news2:
-        logger.info("Starting upsert of news2 data into Pinecone.")
-        upsert_news2_data(news2_dataset, index, embedding_model)
-        logger.info("All news2 data uploaded to Pinecone successfully.")
-
-    # Step 4: Upsert tweet data into Pinecone
+    # Step 3: Upsert tweet data into Pinecone
     if upsert_tweets:
         logger.info("Starting upsert of tweet data into Pinecone.")
         upsert_tweet_data(tweet_dataset, index, embedding_model)
         logger.info("All tweet data uploaded to Pinecone successfully.")
 
-    # Step 5: Upsert forecast data into Pinecone
+    # Step 4: Upsert news2 data into Pinecone
+    if upsert_news2:
+        logger.info("Starting upsert of news2 data into Pinecone.")
+        upsert_news2_data(news2_dataset, index, embedding_model)
+        logger.info("All news2 data uploaded to Pinecone successfully.")
+
+    # --- New Step: Upsert Forecast Data ---
     if upsert_forecast:
         logger.info("Starting upsert of forecast data into Pinecone.")
-        upsert_forecast_data(forecast_folder_path, index, embedding_model)
+        # Define the folder path where forecast JSON files are located
+        forecast_folder_path = r"C:\Users\Pham Ty\Desktop\Thesis\Result_Model\Result_Hydrid"
+        upsert_forecast_data_from_folder(forecast_folder_path, index, embedding_model)
         logger.info("All forecast data uploaded to Pinecone successfully.")
-
-    logger.info("Data upload process completed.")
+    # --- End of New Step ---
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Upsert data into Pinecone.")
