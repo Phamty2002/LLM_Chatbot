@@ -10,10 +10,15 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from dateutil import parser  # For flexible date parsing
+
+# ------------------------------
+# 1. Configuration and Setup
+# ------------------------------
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Set to DEBUG for detailed logs
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -97,9 +102,8 @@ if tokenizer and model:
 # Initialize the SentenceTransformer model for embeddings
 try:
     embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    embedding_model = embedding_model.to(
-        torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    )
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    embedding_model = embedding_model.to(device)
     logger.info("Loaded SentenceTransformer 'all-MiniLM-L6-v2' model.")
 except Exception as e:
     logger.error(f"Error loading SentenceTransformer model: {e}")
@@ -117,12 +121,20 @@ PRICE_TYPE_MAPPING = {
     'low price': 'low'
 }
 
+# ------------------------------
+# 2. Helper Functions
+# ------------------------------
+
 def construct_prompt(query, matches):
+    """
+    Constructs the prompt for the language model using the retrieved context.
+    """
     # Organize context by type for better structure
     context_sections = {
         'stock': [],
         'news': [],
-        'tweet': []
+        'tweet': [],
+        'forecast': []  # Added forecast section
     }
     for match in matches:
         metadata = match['metadata']
@@ -144,7 +156,7 @@ def construct_prompt(query, matches):
                 f"Summary: {summary}"
             )
             context_sections['stock'].append(stock_info)
-        elif metadata.get('type') == 'news' or metadata.get('type') == 'news2':
+        elif metadata.get('type') in ['news', 'news2']:
             headline = metadata.get('headline', 'No Headline')
             content = metadata.get('content', 'No Content')
             publication_date = metadata.get('publication_date', 'Unknown Date')
@@ -166,6 +178,16 @@ def construct_prompt(query, matches):
                 f"Content: {text}"
             )
             context_sections['tweet'].append(tweet_info)
+        elif metadata.get('type') == 'forecast':  # Handle forecast data
+            symbol = metadata.get('symbol', 'Unknown Symbol')
+            date = metadata.get('date', 'Unknown Date')
+            predicted_price = metadata.get('predicted_price', 'Unknown')
+            forecast_info = (
+                f"Stock Symbol: {symbol}\n"
+                f"Date: {date}\n"
+                f"Predicted Price: ${predicted_price}"
+            )
+            context_sections['forecast'].append(forecast_info)
 
     # Build the context string
     context = ""
@@ -175,47 +197,51 @@ def construct_prompt(query, matches):
             for info in infos:
                 context += f"{info}\n\n"
 
-    # Add few-shot examples to the prompt
+    # Add few-shot examples to the prompt (without '**')
     examples = """
-**Examples:**
+Examples:
 
-**Question:** What was the closing price of AAPL on September 19, 2023?
-**Answer:** The closing price of **AAPL** on **September 19, 2023**, was **$150.25**.
+Question: What was the closing price of AAPL on September 19, 2023?
+Answer: The closing price of AAPL on September 19, 2023, was $150.25.
 
-**Question:** Summarize the latest news about Tesla (TSLA).
-**Answer:**
-Tesla has recently unveiled its new **Model Z**, which promises to revolutionize electric vehicles. Highlights include:
-- **Advanced AI capabilities** for autonomous driving.
-- **Extended battery life** increasing range by 20%.
-- **Innovative design** receiving positive industry reviews.
+Question: Summarize the latest news about Tesla (TSLA).
+Answer:
+Tesla has recently unveiled its new Model Z, which promises to revolutionize electric vehicles. Highlights include:
+- Advanced AI capabilities for autonomous driving.
+- Extended battery life increasing range by 20%.
+- Innovative design receiving positive industry reviews.
 
-**Question:** What are people saying about Microsoft?
-**Answer:**
-Recent tweets about **Microsoft** mention:
-- Excitement over the **latest software release** with improved user interface.
-- Discussions about **enhanced security features**.
-- Positive feedback on **performance improvements**.
+Question: What are people saying about Microsoft?
+Answer:
+Recent tweets about Microsoft mention:
+- Excitement over the latest software release with improved user interface.
+- Discussions about enhanced security features.
+- Positive feedback on performance improvements.
 
-**Question:** List the top 5 performing stocks in Q3 2023.
-**Answer:**
-1. **Apple Inc. (AAPL):** Increased by 15% due to strong iPhone sales.
-2. **Microsoft Corp. (MSFT):** Rose by 12% following new software releases.
-3. **Amazon.com Inc. (AMZN):** Gained 10% driven by e-commerce growth.
-4. **Alphabet Inc. (GOOGL):** Surged 8% thanks to advancements in AI.
-5. **Tesla Inc. (TSLA):** Boosted by a 7% rise from the launch of Model Z.
+Question: List the top 5 performing stocks in Q3 2023.
+Answer:
+1. Apple Inc. (AAPL): Increased by 15% due to strong iPhone sales.
+2. Microsoft Corp. (MSFT): Rose by 12% following new software releases.
+3. Amazon.com Inc. (AMZN): Gained 10% driven by e-commerce growth.
+4. Alphabet Inc. (GOOGL): Surged 8% thanks to advancements in AI.
+5. Tesla Inc. (TSLA): Boosted by a 7% rise from the launch of Model Z.
+
+Question: What is the predicted closing price of NVDA on October 25, 2024?
+Answer:
+The predicted closing price of NVDA on October 25, 2024, is $700.50.
 """
 
-    # Construct the prompt with detailed instructions
+    # Construct the prompt with detailed instructions (without bolding)
     prompt = f"""
 You are a highly knowledgeable AI assistant specializing in financial markets, stocks, and related news. Your goal is to provide accurate, concise, and helpful answers based on the provided context.
 
-**Guidelines:**
-- **Use information only from the context** to formulate your response.
-- **Organize your answer with clear paragraphs**, separating different ideas with line breaks.
-- When listing items or points, use **bullet points** or **numbered lists**.
-- **Highlight important names, dates, and figures** using **bold text** (enclosed in double asterisks `**`).
-- **Do not add any information** that is not present in the context.
-- Maintain a **professional and informative tone**.
+Guidelines:
+- Use information only from the context to formulate your response.
+- Organize your answer with clear paragraphs, separating different ideas with line breaks.
+- When listing items or points, use bullet points or numbered lists.
+- Do not add any information that is not present in the context.
+- Maintain a professional and informative tone.
+
 
 {examples}
 
@@ -230,8 +256,13 @@ You are a highly knowledgeable AI assistant specializing in financial markets, s
     return prompt.strip()
 
 def parse_stock_query(query):
-    # Regex patterns to extract price type, stock symbol, and date
-    patterns = [
+    """
+    Parses the user's query to extract price type, stock symbol, and date.
+    Supports both regular and forecast-related queries.
+    Returns a tuple: (price_type, symbol, date)
+    """
+    # Existing price query patterns
+    price_patterns = [
         r"What was the (\w+) price of\s*(\w+)\s*on\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})\??",
         r"(\w+) price of\s*(\w+)\s*on\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})",
         r"How much did\s*(\w+)\s*(\w+) at on\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})\??",
@@ -243,7 +274,18 @@ def parse_stock_query(query):
         r"Find the (\w+) price for\s*(\w+)\s*on\s*(\d{4}-\d{2}-\d{2})\??",
         r"Show me the (\w+) price of\s*(\w+)\s*on\s*(\d{4}-\d{2}-\d{2})\??"
     ]
-    for pattern in patterns:
+
+    # New forecast query patterns
+    forecast_patterns = [
+        r"(\w+)\s+Stock\s+Price\s+Prediction\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\??",
+        r"What\s+is\s+the\s+predicted\s+price\s+of\s+(\w+)\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\??",
+        r"Forecast\s+for\s+(\w+)\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\??",
+        r"(\w+)\s+price\s+forecast\s+for\s+(\d{1,2}/\d{1,2}/\d{4})\??",
+        r"(\w+)\s+Stock\s+Forecast\s+on\s+(\d{1,2}/\d{1,2}/\d{4})\??"
+    ]
+
+    # Iterate over price patterns
+    for pattern in price_patterns:
         match = re.match(pattern, query, re.IGNORECASE)
         if match:
             price_type_raw = match.group(1).lower()
@@ -260,15 +302,33 @@ def parse_stock_query(query):
                     date_obj = datetime.strptime(date_str, '%B %d, %Y')  # e.g., September 19, 2019
                 except ValueError:
                     date_obj = datetime.strptime(date_str, '%Y-%m-%d')  # e.g., 2019-09-19
-                date = date_obj.strftime('%Y-%m-%d')
+                date = date_obj.strftime('%Y-%m-%d')  # Changed to YYYY-MM-DD
                 return price_type, symbol, date
             except ValueError:
                 logger.error(f"Invalid date format in query: {date_str}")
                 return None, None, None
+
+    # Iterate over forecast patterns
+    for pattern in forecast_patterns:
+        match = re.match(pattern, query, re.IGNORECASE)
+        if match:
+            symbol = match.group(1).upper()
+            date_str = match.group(2)
+            try:
+                date_obj = parser.parse(date_str)
+                date = date_obj.strftime('%Y-%m-%d')  # Change to YYYY-MM-DD
+                return 'predicted_price', symbol, date
+            except (ValueError, parser.ParserError):
+                logger.error(f"Invalid date format in forecast query: {date_str}")
+                return None, None, None
+
     return None, None, None
 
 @lru_cache(maxsize=256)
 def get_stock_price(price_type, symbol, date):
+    """
+    Retrieves the specified stock price from Pinecone based on the price type, symbol, and date.
+    """
     # Define metadata filter
     metadata_filter = {
         "type": {"$eq": "stock"},
@@ -304,7 +364,49 @@ def get_stock_price(price_type, symbol, date):
         logger.info(f"No stock data found for {symbol} on {date}.")
         return f"No stock data found for {symbol} on {date}."
 
+@lru_cache(maxsize=256)
+def get_forecast_price(symbol, date):
+    """
+    Retrieves the forecasted stock price from Pinecone based on the symbol and date.
+    """
+    metadata_filter = {
+        "type": {"$eq": "forecast"},
+        "symbol": {"$eq": symbol},
+        "date": {"$eq": date}
+    }
+    specific_query = f"forecast price for {symbol} on {date}"
+    specific_embedding = embedding_model.encode(specific_query).tolist()
+    try:
+        search_response = index.query(
+            vector=specific_embedding,
+            top_k=3,  # Increased to retrieve multiple potential matches
+            include_values=False,
+            include_metadata=True,
+            filter=metadata_filter
+        )
+        logger.debug(f"Pinecone search response (forecast): {search_response}")
+    except Exception as e:
+        logger.error(f"Error querying Pinecone (forecast): {e}")
+        return "An error occurred while retrieving forecast data."
+
+    matches = search_response.get('matches', [])
+    if matches:
+        logger.info(f"Found {len(matches)} forecast matches for {symbol} on {date}.")
+        # Assuming the most relevant match is the first one
+        metadata = matches[0]['metadata']
+        predicted_price = metadata.get('predicted_price', 'Unknown')
+        symbol = metadata.get('symbol', 'Unknown')
+        date = metadata.get('date', 'Unknown')
+        logger.debug(f"Retrieved forecast metadata: {metadata}")
+        return f"The predicted price of {symbol} on {date} is ${predicted_price}."
+    else:
+        logger.info(f"No forecast data found for {symbol} on {date}.")
+        return f"No forecast data found for {symbol} on {date}."
+
 def chatbot_response(query):
+    """
+    Generates a response to the user's query by determining its type and retrieving relevant information.
+    """
     try:
         logger.info(f"Received query: {query}")
 
@@ -364,7 +466,7 @@ def chatbot_response(query):
 
             # Construct the response
             tweets_list = "\n".join(tweets)
-            response = f"Here are some tweets by {writer_name}:\n{tweets_list}"
+            response = f"Here are some tweets by {writer_name.capitalize()}:\n{tweets_list}"
             logger.info(f"Responding with tweets for writer '{writer_name}'.")
             return response
 
@@ -372,124 +474,140 @@ def chatbot_response(query):
             # Check if the query is asking for a specific stock price type on a specific date
             price_type, symbol, date = parse_stock_query(query)
             if price_type and symbol and date:
-                logger.info(f"Detected {price_type} price query for symbol: {symbol} on date: {date}")
-                response = get_stock_price(price_type, symbol, date)
-                logger.info(f"Responding with stock price: {response}")
-                return response
-            else:
-                # Handle general queries using RAG
-                logger.info("Detected general query. Performing vector similarity search.")
-
-                # Generate embedding for the user's query
-                try:
-                    query_embedding = embedding_model.encode(query).tolist()
-                    logger.debug(f"Generated query embedding.")
-                except Exception as e:
-                    logger.error(f"Error generating embedding for query: {e}")
-                    return "An error occurred while processing your query."
-
-                # Perform a similarity search in Pinecone
-                try:
-                    search_response = index.query(
-                        vector=query_embedding,
-                        top_k=5,  # Adjusted for better context
-                        include_values=False,
-                        include_metadata=True,
-                        filter={
-                            "type": {"$in": ["news", "news2", "stock", "tweet"]},
-                            # Additional filters can be added here
-                        }
-                    )
-                    logger.debug(f"Pinecone search response for general query: {search_response}")
-                except Exception as e:
-                    logger.error(f"Error querying Pinecone for general query: {e}")
-                    return "An error occurred while retrieving information."
-
-                # Check if any matches were found
-                matches = search_response.get('matches', [])
-                if not matches:
-                    logger.info("No matches found in Pinecone.")
-                    return "Sorry, I couldn't find any related information."
-
-                # Re-rank matches based on score (already sorted by Pinecone)
-                # Optionally, we could implement additional re-ranking here
-
-                # Construct the prompt using retrieved information
-                prompt = construct_prompt(query, matches)
-                logger.debug(f"Constructed prompt for model.")
-
-                if not (tokenizer and model):
-                    logger.error("Tokenizer or model not initialized.")
-                    return "Sorry, the system is currently experiencing issues and cannot generate a response right now."
-
-                # Tokenize the prompt
-                try:
-                    inputs = tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=2048,
-                        padding=True,
-                        add_special_tokens=True  # Ensure special tokens are included
-                    ).to(model.device)
-                    logger.debug(f"Tokenized inputs prepared.")
-                except Exception as e:
-                    logger.error(f"Error tokenizing prompt: {e}")
-                    return "An error occurred while processing your request."
-
-                # Generate response from the model
-                try:
-                    with torch.no_grad():
-                        # Use sampling for more diverse responses
-                        outputs = model.generate(
-                            input_ids=inputs.input_ids,
-                            attention_mask=inputs.attention_mask,
-                            max_new_tokens=300,  # Increased to allow for longer responses
-                            do_sample=True,
-                            top_p=0.9,          # Adjusted for better diversity
-                            temperature=0.7,    # Slightly lower for more focused responses
-                            num_return_sequences=1,  # Return one response
-                            pad_token_id=tokenizer.pad_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
-                        )
-                    logger.debug(f"Model outputs generated.")
-                except Exception as e:
-                    logger.error(f"Error generating response from model: {e}")
-                    return "An error occurred while generating a response."
-
-                # Extract the generated response
-                try:
-                    generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
-                    response = tokenizer.decode(
-                        generated_tokens,
-                        skip_special_tokens=True
-                    ).strip()
-                    logger.debug(f"Decoded response: {response}")
-                except Exception as e:
-                    logger.error(f"Error decoding model output: {e}")
-                    return "An error occurred while processing the model's response."
-
-                # Clean up the response while preserving line breaks and numbered lists
-                response_lines = response.split('\n')
-                cleaned_lines = []
-                for line in response_lines:
-                    stripped_line = line.strip()
-                    if stripped_line:
-                        cleaned_lines.append(stripped_line)
-                response = '\n'.join(cleaned_lines)
-                if not response.endswith('.'):
-                    response += '.'
-                logger.info(f"Generated response: {response}")
-
-                # Fallback mechanism
-                if not response:
-                    return "I'm sorry, I couldn't generate a response based on the provided information."
+                if price_type == 'predicted_price':
+                    # Handle forecast queries
+                    logger.info(f"Detected forecast price query for symbol: {symbol} on date: {date}")
+                    response = get_forecast_price(symbol, date)
+                    logger.info(f"Responding with forecast price: {response}")
+                    return response
                 else:
+                    # Handle regular stock price queries
+                    logger.info(f"Detected {price_type} price query for symbol: {symbol} on date: {date}")
+                    response = get_stock_price(price_type, symbol, date)
+                    logger.info(f"Responding with stock price: {response}")
                     return response
 
+            # Handle general queries using RAG
+            logger.info("Detected general query. Performing vector similarity search.")
+
+            # Generate embedding for the user's query
+            try:
+                query_embedding = embedding_model.encode(query).tolist()
+                logger.debug(f"Generated query embedding.")
+            except Exception as e:
+                logger.error(f"Error generating embedding for query: {e}")
+                return "An error occurred while processing your query."
+
+            # Perform a similarity search in Pinecone
+            try:
+                search_response = index.query(
+                    vector=query_embedding,
+                    top_k=5,  # Adjusted for better context
+                    include_values=False,
+                    include_metadata=True,
+                    filter={
+                        "type": {"$in": ["news", "news2", "stock", "tweet", "forecast"]}
+                    }
+                )
+                logger.debug(f"Pinecone search response for general query: {search_response}")
+            except Exception as e:
+                logger.error(f"Error querying Pinecone for general query: {e}")
+                return "An error occurred while retrieving information."
+
+            # Check if any matches were found
+            matches = search_response.get('matches', [])
+            if not matches:
+                logger.info("No matches found in Pinecone.")
+                return "Sorry, I couldn't find any related information."
+
+            # Log the matches for debugging
+            logger.info(f"Number of matches found: {len(matches)}")
+            for idx, match in enumerate(matches):
+                logger.debug(f"Match {idx}: Metadata: {match['metadata']}")
+
+            # Construct the prompt using retrieved information
+            prompt = construct_prompt(query, matches)
+            logger.debug(f"Constructed prompt for model:\n{prompt}")
+
+            if not (tokenizer and model):
+                logger.error("Tokenizer or model not initialized.")
+                return "Sorry, the system is currently experiencing issues and cannot generate a response right now."
+
+            # Tokenize the prompt
+            try:
+                inputs = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=2048,
+                    padding=True,
+                    add_special_tokens=True  # Ensure special tokens are included
+                ).to(model.device)
+                logger.debug(f"Tokenized inputs prepared.")
+            except Exception as e:
+                logger.error(f"Error tokenizing prompt: {e}")
+                return "An error occurred while processing your request."
+
+            # Generate response from the model
+            try:
+                with torch.no_grad():
+                    # Use sampling for more diverse responses
+                    outputs = model.generate(
+                        input_ids=inputs.input_ids,
+                        attention_mask=inputs.attention_mask,
+                        max_new_tokens=300,  # Increased to allow for longer responses
+                        do_sample=True,
+                        top_p=0.9,          # Adjusted for better diversity
+                        temperature=0.7,    # Slightly lower for more focused responses
+                        num_return_sequences=1,  # Return one response
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                logger.debug(f"Model outputs generated.")
+            except Exception as e:
+                logger.error(f"Error generating response from model: {e}")
+                return "An error occurred while generating a response."
+
+            # Extract the generated response
+            try:
+                generated_tokens = outputs[0][inputs.input_ids.shape[-1]:]
+                response = tokenizer.decode(
+                    generated_tokens,
+                    skip_special_tokens=True
+                ).strip()
+                logger.debug(f"Decoded response: {response}")
+            except Exception as e:
+                logger.error(f"Error decoding model output: {e}")
+                return "An error occurred while processing the model's response."
+
+            # Remove '**' from the response
+            response = response.replace('**', '')
+
+            # Clean up the response while preserving line breaks and numbered lists
+            response_lines = response.split('\n')
+            cleaned_lines = []
+            for line in response_lines:
+                stripped_line = line.strip()
+                if stripped_line:
+                    cleaned_lines.append(stripped_line)
+            response = '\n'.join(cleaned_lines)
+            if not response.endswith('.'):
+                response += '.'
+            logger.info(f"Generated response: {response}")
+
+            # Fallback mechanism
+            if not response:
+                return "I'm sorry, I couldn't generate a response based on the provided information."
+            else:
+                return response
+
     except Exception as e:
-        logger.error(f"Error processing query '{query}': {e}")
-        return "An error occurred while processing your request. Please try again later."
+        logger.error(f"Error in chatbot_response: {e}")
+        return "An unexpected error occurred while processing your request."
+
+# ------------------------------
+# 3. Flask API Setup
+# ------------------------------
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -497,12 +615,20 @@ CORS(app)
 
 @app.route('/chatbot', methods=['POST'])
 def chatbot_api():
+    """
+    API endpoint to handle chatbot queries.
+    Expects JSON payload with a 'query' field.
+    """
     data = request.get_json()
     if not data or 'query' not in data:
         return jsonify({'error': 'Please provide a query in JSON format.'}), 400
     query = data['query']
     response = chatbot_response(query)
     return jsonify({'response': response})
+
+# ------------------------------
+# 4. Run the Flask App
+# ------------------------------
 
 if __name__ == "__main__":
     # Run the Flask app
