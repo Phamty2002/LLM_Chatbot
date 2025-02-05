@@ -410,6 +410,11 @@ def chatbot_response(query):
     try:
         logger.info(f"Received query: {query}")
 
+        # Check if the query is a simple greeting or a general casual phrase
+        if query.lower() in ['hello', 'hi', 'hey', 'greetings', 'howdy', 'good morning', 'good afternoon', 'good evening']:
+            logger.info(f"Detected greeting query: {query}")
+            return "Hello! How can I assist you today with financial markets, stocks, or related news?"
+
         # Detect if the query is requesting tweets by a specific writer
         tweet_query_match = re.match(r"List of tweets by writer named\s*:\s*(.+)", query, re.IGNORECASE)
 
@@ -604,6 +609,7 @@ def chatbot_response(query):
     except Exception as e:
         logger.error(f"Error in chatbot_response: {e}")
         return "An unexpected error occurred while processing your request."
+
 
 # ------------------------------
 # 3. Flask API Setup
