@@ -101,7 +101,7 @@ if tokenizer and model:
 
 # Initialize the SentenceTransformer model for embeddings
 try:
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', use_auth_token="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")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     embedding_model = embedding_model.to(device)
     logger.info("Loaded SentenceTransformer 'all-MiniLM-L6-v2' model.")
