@@ -784,5 +784,5 @@ if __name__ == "__main__":
         upsert_stocks=args.stocks,
         upsert_news=args.news,
         upsert_news2=args.news2,
-        upsert_forecast=args.forecast  # Pass the new argument
+        upsert_forecast=args.forecast
     )
